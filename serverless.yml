@@ -1,0 +1,228 @@
+service: medical-appointment-system
+
+useDotenv: true
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  environment:
+    APPOINTMENTS_TABLE: ${self:service}-appointments-${self:provider.stage}
+    SNS_TOPIC_ARN: !Ref AppointmentTopic
+    EVENT_BRIDGE_NAME: ${self:service}-events-${self:provider.stage}
+    SQS_COMPLETION_URL: !Ref CompletionQueue
+    MYSQL_HOST: ${env:MYSQL_HOST}
+    MYSQL_PORT: ${env:MYSQL_PORT}
+    MYSQL_USER: ${env:MYSQL_USER}
+    MYSQL_PASSWORD: ${env:MYSQL_PASSWORD}
+    MYSQL_PE_DATABASE: ${env:MYSQL_PE_DATABASE}
+    MYSQL_CL_DATABASE: ${env:MYSQL_CL_DATABASE}
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - dynamodb:Query
+            - dynamodb:Scan
+            - dynamodb:GetItem
+            - dynamodb:PutItem
+            - dynamodb:UpdateItem
+            - dynamodb:DeleteItem
+          Resource:
+            - !GetAtt AppointmentsTable.Arn
+            - !Sub "${AppointmentsTable.Arn}/index/*"
+        - Effect: Allow
+          Action:
+            - sns:Publish
+          Resource:
+            - !Ref AppointmentTopic
+        - Effect: Allow
+          Action:
+            - sqs:SendMessage
+            - sqs:ReceiveMessage
+            - sqs:DeleteMessage
+            - sqs:GetQueueAttributes
+          Resource:
+            - !GetAtt SqsPe.Arn
+            - !GetAtt SqsCl.Arn
+            - !GetAtt CompletionQueue.Arn
+        - Effect: Allow
+          Action:
+            - events:PutEvents
+          Resource:
+            - !GetAtt AppointmentEventBridge.Arn
+
+plugins:
+  - serverless-dotenv-plugin
+  - serverless-esbuild
+  - serverless-offline-sqs
+  - serverless-offline
+
+custom:
+  esbuild:
+    bundle: true
+    minify: false
+    sourcemap: true
+    external: []
+    target: node18
+    platform: node
+
+functions:
+  appointmentApi:
+    handler: src/infrastructure/handlers/appointment-api.handler
+    events:
+      - http:
+          path: /appointments
+          method: post
+          cors: true
+      - http:
+          path: /appointments/{insuredId}
+          method: get
+          cors: true
+
+  appointmentCompletion:
+    handler: src/infrastructure/handlers/appointment-completion.handler
+    events:
+      - sqs:
+          arn: !GetAtt CompletionQueue.Arn
+          batchSize: 10
+
+  appointmentPe:
+    handler: src/infrastructure/handlers/appointment-pe.handler
+    events:
+      - sqs:
+          arn: !GetAtt SqsPe.Arn
+          batchSize: 10
+
+  appointmentCl:
+    handler: src/infrastructure/handlers/appointment-cl.handler
+    events:
+      - sqs:
+          arn: !GetAtt SqsCl.Arn
+          batchSize: 10
+
+resources:
+  Resources:
+    AppointmentsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.APPOINTMENTS_TABLE}
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+          - AttributeName: insuredId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: insuredId-index
+            KeySchema:
+              - AttributeName: insuredId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+        BillingMode: PAY_PER_REQUEST
+
+    AppointmentTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-appointments-${self:provider.stage}
+
+    SqsPe:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-pe-${self:provider.stage}
+        VisibilityTimeout: 300
+
+    SqsCl:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-cl-${self:provider.stage}
+        VisibilityTimeout: 300
+
+    CompletionQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-completion-${self:provider.stage}
+        VisibilityTimeout: 300
+
+    SnsSubscriptionPe:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref AppointmentTopic
+        Protocol: sqs
+        Endpoint: !GetAtt SqsPe.Arn
+        FilterPolicy:
+          countryISO: ["PE"]
+
+    SnsSubscriptionCl:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref AppointmentTopic
+        Protocol: sqs
+        Endpoint: !GetAtt SqsCl.Arn
+        FilterPolicy:
+          countryISO: ["CL"]
+
+    SqsPePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref SqsPe
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt SqsPe.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref AppointmentTopic
+
+    SqsClPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref SqsCl
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt SqsCl.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref AppointmentTopic
+
+    AppointmentEventBridge:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: ${self:provider.environment.EVENT_BRIDGE_NAME}
+
+    EventBridgeRule:
+      Type: AWS::Events::Rule
+      Properties:
+        EventBusName: !Ref AppointmentEventBridge
+        EventPattern:
+          source: ["appointment.service"]
+          detail-type: ["Appointment Confirmed"]
+        Targets:
+          - Arn: !GetAtt CompletionQueue.Arn
+            Id: CompletionTarget
+
+    EventBridgeToSqsPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref CompletionQueue
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt CompletionQueue.Arn
