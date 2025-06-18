@@ -1,4 +1,4 @@
-import { APIGatewayProxyHandler } from 'aws-lambda'
+import { APIGatewayProxyEvent, APIGatewayProxyHandler } from 'aws-lambda'
 import { CreateAppointmentUseCase } from '../../application/use-cases/CreateAppointmentUseCase'
 import { GetAppointmentsByInsuredIdUseCase } from '../../application/use-cases/GetAppointmentsByInsuredIdUseCase'
 import { CountryISO } from '../../domain/entities/Appointment'
@@ -9,7 +9,9 @@ import { AWSNotificationService } from '../services/AWSNotificationService'
 const appointmentRepository = new DynamoDBAppointmentRepository()
 const notificationService = new AWSNotificationService()
 
-export const handler: APIGatewayProxyHandler = async (event) => {
+export const handler: APIGatewayProxyHandler = async (
+  event: APIGatewayProxyEvent
+) => {
   if (event.httpMethod === 'POST' && event.path === '/appointments') {
     return await handleCreateAppointment(event)
   }
@@ -24,7 +26,7 @@ export const handler: APIGatewayProxyHandler = async (event) => {
   }
 }
 
-async function handleCreateAppointment(event: any) {
+async function handleCreateAppointment(event: APIGatewayProxyEvent) {
   try {
     const body = JSON.parse(event.body || '{}')
 
@@ -77,8 +79,17 @@ async function handleCreateAppointment(event: any) {
   }
 }
 
-async function handleGetAppointments(event: any) {
+async function handleGetAppointments(event: APIGatewayProxyEvent) {
   try {
+    if (!event.pathParameters?.insuredId) {
+      return {
+        statusCode: 400,
+        body: JSON.stringify({
+          message: 'Missing insuredId parameter',
+        }),
+      }
+    }
+
     const insuredId = event.pathParameters.insuredId
 
     const getUseCase = new GetAppointmentsByInsuredIdUseCase(
